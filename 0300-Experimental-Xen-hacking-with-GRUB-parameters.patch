@@ -1,0 +1,334 @@
+diff --git a/grub-core/Makefile.core.def b/grub-core/Makefile.core.def
+index 95fd18d..3a50f3c 100644
+--- a/grub-core/Makefile.core.def
++++ b/grub-core/Makefile.core.def
+@@ -254,6 +254,7 @@ kernel = {
+   xen = term/xen/console.c;
+   xen = disk/xen/xendisk.c;
+   xen = commands/boot.c;
++  xen = kern/xen/cmdline.c;
+ 
+   i386_xen_pvh = commands/boot.c;
+   i386_xen_pvh = disk/xen/xendisk.c;
+@@ -261,6 +262,7 @@ kernel = {
+   i386_xen_pvh = kern/i386/xen/tsc.c;
+   i386_xen_pvh = kern/i386/xen/pvh.c;
+   i386_xen_pvh = kern/xen/init.c;
++  i386_xen_pvh = kern/xen/cmdline.c;
+   i386_xen_pvh = term/xen/console.c;
+ 
+   ia64_efi = kern/ia64/efi/startup.S;
+diff --git a/grub-core/kern/i386/xen/pvh.c b/grub-core/kern/i386/xen/pvh.c
+index 91fbca8..9fb0480 100644
+--- a/grub-core/kern/i386/xen/pvh.c
++++ b/grub-core/kern/i386/xen/pvh.c
+@@ -352,6 +352,22 @@ grub_xen_setup_pvh (void)
+   grub_xen_mm_init_regions ();
+ 
+   grub_rsdp_addr = pvh_start_info->rsdp_paddr;
++  int xen_cmdline_fits = 0;
++  char *xen_cmdline = (char *) pvh_start_info->cmdline_paddr;
++  for (int i = 0; i < 1024; i++)
++    {
++      if (xen_cmdline[i] == '\0')
++        {
++          xen_cmdline_fits = 1;
++          break;
++        }
++    }
++  if (xen_cmdline_fits == 1)
++    {
++      grub_strncpy ((char *) grub_xen_start_page_addr->cmd_line,
++		    (char *) pvh_start_info->cmdline_paddr,
++		    MAX_GUEST_CMDLINE);
++    }
+ }
+ 
+ grub_err_t
+diff --git a/grub-core/kern/main.c b/grub-core/kern/main.c
+index 8e89763..c078075 100644
+--- a/grub-core/kern/main.c
++++ b/grub-core/kern/main.c
+@@ -35,6 +35,10 @@
+ #include <grub/machine/memory.h>
+ #endif
+ 
++#if defined (GRUB_MACHINE_XEN) || defined (GRUB_MACHINE_XEN_PVH)
++#include <grub/xen.h>
++#endif
++
+ grub_addr_t
+ grub_modules_get_end (void)
+ {
+@@ -362,6 +366,14 @@ grub_main (void)
+   grub_env_export ("root");
+   grub_env_export ("prefix");
+ 
++  /*
++   * Parse command line parameters from Xen and export them as environment
++   * variables
++   */
++#if defined (GRUB_MACHINE_XEN) || defined (GRUB_MACHINE_XEN_PVH)
++  grub_parse_xen_cmdline ();
++#endif
++
+   /* Reclaim space used for modules.  */
+   reclaim_module_space ();
+ 
+diff --git a/grub-core/kern/xen/cmdline.c b/grub-core/kern/xen/cmdline.c
+new file mode 100644
+index 0000000..7626799
+--- /dev/null
++++ b/grub-core/kern/xen/cmdline.c
+@@ -0,0 +1,223 @@
++/*
++ *  GRUB  --  GRand Unified Bootloader
++ *  Copyright (C) 2025  Free Software Foundation, Inc.
++ *
++ *  GRUB is free software: you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation, either version 3 of the License, or
++ *  (at your option) any later version.
++ *
++ *  GRUB is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with GRUB.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <grub/env.h>
++#include <grub/misc.h>
++#include <grub/mm.h>
++#include <grub/xen.h>
++
++#define PARSER_HIT_BACKSLASH 0x1
++#define PARSER_IN_SINGLE_QUOTES 0x2
++#define PARSER_IN_DOUBLE_QUOTES 0x4
++#define PARSER_BASE_WORD_LEN 16
++
++grub_size_t word_list_len;
++char **word_list;
++grub_size_t current_word_len;
++grub_size_t current_word_pos;
++char *current_word;
++char current_char;
++grub_size_t param_dict_len;
++char **param_keys;
++char **param_vals;
++
++static void
++append_char_to_word (void)
++{
++  if (current_word_pos == current_word_len)
++    {
++      current_word_len *= 2;
++      current_word = grub_realloc (current_word, current_word_len);
++    }
++
++  current_word[current_word_pos] = current_char;
++  current_word_pos++;
++}
++
++static void
++append_word_to_list (void)
++{
++  for (grub_size_t i = 0; i < current_word_pos; i++)
++    {
++      if (current_word[i] <= 0x1F || current_word[i] >= 0x7F)
++        {
++          grub_free (current_word);
++          goto reset_word;
++        }
++    }
++  current_char = '\0';
++  append_char_to_word ();
++  current_word_len = grub_strlen (current_word) + 1;
++  current_word = grub_realloc (current_word, current_word_len);
++  word_list_len++;
++  word_list = grub_realloc (word_list, word_list_len * sizeof (char *));
++  word_list[word_list_len - 1] = current_word;
++
++reset_word:
++  current_word_len = PARSER_BASE_WORD_LEN;
++  current_word_pos = 0;
++  current_word = grub_malloc (current_word_len);
++}
++
++int
++check_key_is_safe (char *key, grub_size_t len)
++{
++  /*
++   * Ensure only a-z, A-Z, and _ are allowed.
++   */
++  for (grub_size_t i = 0; i < len; i++)
++  {
++    if (! ((key[i] >= 'A' && key[i] <= 'Z')
++          || (key[i] >= 'a' && key[i] <= 'z')
++          || (key[i] == '_') ) )
++      {
++        return 0;
++      }
++  }
++  return 1;
++}
++
++void
++grub_parse_xen_cmdline (void)
++{
++  word_list = grub_malloc (0);
++  current_word_len = PARSER_BASE_WORD_LEN;
++  current_word = grub_malloc (current_word_len);
++  param_keys = grub_malloc (0);
++  param_vals = grub_malloc (0);
++
++  grub_uint8_t parse_flags = 0;
++  char *cmdline = (char *)grub_xen_start_page_addr->cmd_line;
++
++  for (grub_size_t i = 0; i < grub_strlen (cmdline); i++)
++    {
++      current_char = cmdline[i];
++
++      if (parse_flags & PARSER_HIT_BACKSLASH)
++        {
++          parse_flags ^= PARSER_HIT_BACKSLASH;
++          append_char_to_word ();
++          continue;
++        }
++
++      if (current_char == '\\')
++        {
++          parse_flags ^= PARSER_HIT_BACKSLASH;
++          continue;
++        }
++
++      if (current_char == '\'')
++        {
++          if (parse_flags & PARSER_IN_DOUBLE_QUOTES)
++            {
++              append_char_to_word ();
++              continue;
++            }
++
++          parse_flags ^= PARSER_IN_SINGLE_QUOTES;
++          continue;
++        }
++
++      if (current_char == '"')
++        {
++          if (parse_flags & PARSER_IN_SINGLE_QUOTES)
++            {
++              append_char_to_word ();
++              continue;
++            }
++
++          parse_flags ^= PARSER_IN_DOUBLE_QUOTES;
++          continue;
++        }
++
++      if (current_char == ' ')
++        {
++          if (parse_flags & PARSER_IN_SINGLE_QUOTES
++              || parse_flags & PARSER_IN_DOUBLE_QUOTES)
++            {
++              append_char_to_word ();
++              continue;
++            }
++
++          append_word_to_list ();
++          continue;
++        }
++
++      append_char_to_word ();
++    }
++
++  if (current_word_pos > 0)
++    {
++      append_word_to_list ();
++    }
++
++  param_keys = grub_realloc (param_keys, word_list_len * sizeof (char *));
++  param_vals = grub_realloc (param_vals, word_list_len * sizeof (char *));
++  for (grub_size_t i = 0; i < word_list_len; i++)
++    {
++      current_word = word_list[i];
++      current_word_len = grub_strlen (current_word) + 1;
++      char *current_word_eq_ptr = grub_strchr (current_word, '=');
++      if (current_word_eq_ptr)
++        {
++          grub_size_t eq_idx
++              = (grub_size_t)(current_word_eq_ptr - current_word);
++          grub_size_t pre_eq_len
++              = current_word_len - (current_word_len - eq_idx);
++          grub_size_t post_eq_len = current_word_len - eq_idx - 1;
++          if (check_key_is_safe (current_word, pre_eq_len))
++            {
++              param_keys[param_dict_len] = grub_malloc (pre_eq_len + 1);
++              param_vals[param_dict_len] = grub_malloc (post_eq_len + 1);
++              grub_strncpy (param_keys[param_dict_len],
++			    current_word, pre_eq_len);
++              grub_strncpy (param_vals[param_dict_len],
++			    current_word + pre_eq_len + 1, post_eq_len);
++              param_keys[param_dict_len][pre_eq_len] = '\0';
++              param_vals[param_dict_len][post_eq_len] = '\0';
++	      param_dict_len++;
++            }
++        }
++      else
++        {
++          if (check_key_is_safe (current_word, current_word_len - 1))
++            {
++              param_keys[param_dict_len] = grub_malloc (current_word_len + 1);
++              param_vals[param_dict_len] = grub_malloc (2);
++              grub_strncpy (param_keys[param_dict_len],
++			    current_word, current_word_len);
++              param_keys[param_dict_len][current_word_len] = '\0';
++              grub_strcpy (param_vals[param_dict_len], "1\0");
++	      param_dict_len++;
++            }
++        }
++    }
++
++  for (grub_size_t i = 0; i < param_dict_len; i++)
++    {
++      grub_env_set (param_keys[i], param_vals[i]);
++      grub_env_export (param_keys[i]);
++      grub_free (param_keys[i]);
++      grub_free (param_vals[i]);
++      grub_free (word_list[i]);
++    }
++
++  grub_free (param_keys);
++  grub_free (param_vals);
++  grub_free (word_list);
++}
+diff --git a/grub-core/loader/i386/linux.c b/grub-core/loader/i386/linux.c
+index 90121e9..818ceb3 100644
+--- a/grub-core/loader/i386/linux.c
++++ b/grub-core/loader/i386/linux.c
+@@ -64,6 +64,10 @@ GRUB_MOD_LICENSE ("GPLv3+");
+ #define ACCEPTS_PURE_TEXT 1
+ #endif
+ 
++#ifdef GRUB_MACHINE_XEN_PVH
++#include <grub/xen.h>
++#endif
++
+ static grub_dl_t my_mod;
+ 
+ static grub_size_t linux_mem_size;
+diff --git a/include/grub/xen.h b/include/grub/xen.h
+index 91cb7cf..7f9efee 100644
+--- a/include/grub/xen.h
++++ b/include/grub/xen.h
+@@ -89,6 +89,8 @@ void grub_console_init (void);
+ void grub_xendisk_fini (void);
+ void grub_xendisk_init (void);
+ 
++void grub_parse_xen_cmdline (void);
++
+ #ifdef __x86_64__
+ typedef grub_uint64_t grub_xen_mfn_t;
+ #else
