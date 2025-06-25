@@ -300,6 +300,7 @@ Patch0281: 0281-loader-efi-Fix-RISC-V-build.patch
 Patch0282: 0282-kern-riscv-efi-init-Use-time-register-in-grub_efi_ge.patch
 Patch0283: 0283-Use-medany-instead-of-large-model-for-RISCV.patch
 Patch0284: 0284-fs-xfs-Fix-large-extent-counters-incompat-feature-su.patch
+Patch0300: 0300-Add-Xen-parameter-parsing.patch
 
 
 BuildRequires:  autoconf
